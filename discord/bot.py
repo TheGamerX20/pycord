@@ -167,6 +167,35 @@ class ApplicationCommandMixin:
 
         .. versionadded:: 2.0
         """
+
+        async def add_perm_ids(guild_id, cmd_perms):
+            for perm in cmd_perms:
+                if perm['type'] == 1 and isinstance(perm['id'], str):
+                    guild = self.get_guild(guild_id)
+                    role = get(guild.roles, name=perm['id'])
+
+                    # If not missing
+                    if not role == None:
+                        perm['id'] = role.id
+                    else:
+                        cmd_perms.pop(perm)
+                        print("No Role ID found in Guild (" + guild + ") for Role (" + perm['id'] + ")")
+                elif perm['type'] == 2 and isinstance(perm['id'], str) and perm['id'] == "owner":
+                    app = await self.application_info()  # type: ignore
+                    if app.team:
+                        cmd_perms.pop(perm)
+                        for m in app.team.members:
+                            cmd_perms.append({"id": m.id, "type": 2, "permission": True})
+
+                        # Check again if it passes limit
+                        if len(cmd_perms) > 10:
+                            print("Guild Command '" + cmd.name + "' has more than 10 permission overrides due to is_owner()'s team.\nwill only use the first 10 permission overrides.")
+                            cmd_perms = cmd_perms[:10]
+                    else:
+                        perm['id'] = app.owner.id
+
+            return cmd_perms
+
         commands = []
 
         registered_commands = await self.http.get_global_commands(self.user.id)
@@ -192,10 +221,16 @@ class ApplicationCommandMixin:
                 to_update = update_guild_commands[guild_id]
                 update_guild_commands[guild_id] = to_update + [as_dict]
 
+        # Guild Command Permissions
+        guild_permissions: List = {}
+
         for guild_id in update_guild_commands:
             try:
                 cmds = await self.http.bulk_upsert_guild_commands(self.user.id, guild_id,
                                                                   update_guild_commands[guild_id])
+
+                # Permissions for this Guild
+                guild_permissions_to_edit: List = []
             except Forbidden:
                 if not update_guild_commands[guild_id]:
                     continue
@@ -207,7 +242,21 @@ class ApplicationCommandMixin:
                     cmd = get(self.to_register, name=i["name"], description=i["description"], type=i['type'])
                     self.app_commands[i["id"]] = cmd
 
+                    # Permissions
+                    if not cmd.permissions == None:
+                        if len(cmd.permissions) <= 10:
+                            guild_permissions_to_edit.append({"id": i["id"], "permissions": await add_perm_ids(guild_id, cmd.permissions)})
+                        else:
+                            print("Guild Command '" + cmd.name + "' has more than 10 permission overrides.\nwill only use the first 10 permission overrides.")
+                            guild_permissions_to_edit.append({"id": i["id"], "permissions": await add_perm_ids(guild_id, cmd.permissions[:10])})
+
+                # Append this Guild's Permissions to a List
+                guild_permissions[guild_id] = guild_permissions_to_edit
+
         cmds = await self.http.bulk_upsert_global_commands(self.user.id, commands)
+
+        # Global Command Permissions
+        global_permissions: List = []
 
         for i in cmds:
             cmd = get(
@@ -217,6 +266,26 @@ class ApplicationCommandMixin:
                 type=i["type"],
             )
             self.app_commands[i["id"]] = cmd
+
+            # Permissions (Roles will be converted to IDs just before Upsert for Global Commands)
+            if not cmd.permissions == None:
+                if len(cmd.permissions) <= 10:
+                    global_permissions.append({"id": i["id"], "permissions": cmd.permissions})
+                else:
+                    print("Global Command '" + cmd.name + "' has more than 10 permission overrides.\nwill only use the first 10 permission overrides.")
+                    global_permissions.append({"id": i["id"], "permissions": cmd.permissions[:10]})
+
+        # Upsert Permissions
+        async for guild in self.fetch_guilds(limit=None):
+            # Get Guild Slash Command Permissions (Should already be set up)
+            guild_cmd_perms = guild_permissions[guild.id]
+
+            # Setup Global Command Permissions per-guild
+            for perm in global_permissions:
+                guild_cmd_perms.append({"id": perm["id"], "permissions": await add_perm_ids(guild.id, perm["permissions"])})
+
+            # Upsert
+            await self.http.bulk_upsert_command_permissions(self.user.id, guild.id, guild_cmd_perms)
 
     async def handle_interaction(self, interaction: Interaction) -> None:
         """|coro|
